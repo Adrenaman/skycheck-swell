@@ -10,16 +10,22 @@ STEPS = list(range(0, 145, 3)) + list(range(150, 175, 6))  # 0-144 h every 3 h, 
 PARAMS = ["swh", "pp1d", "mwd"]   # wave height (m), peak period (s), mean direction (deg, coming from)
 
 def download(target="wave.grib2"):
+    """ECMWF copies its open data to AWS, Azure and Google Cloud. Try those first: ECMWF's own
+    server limits connections and often answers "429 Too Many Requests" to shared cloud runners."""
     from ecmwf.opendata import Client
-    client = Client(source="ecmwf")
     last = None
-    for run in (12, 0):   # the 00 and 12 UTC runs go out to 10 days; use the newest one available
-        try:
-            client.retrieve(time=run, stream="wave", type="fc", step=STEPS, param=PARAMS, target=target)
-            return target
-        except Exception as e:
-            last = e
-    raise SystemExit(f"Download failed: {last}")
+    for source in ("aws", "azure", "google", "ecmwf"):
+        client = Client(source=source)
+        for run in (12, 0):   # the 00 and 12 UTC runs go out to 10 days; use the newest one available
+            try:
+                print(f"Trying {source}, {run:02d} UTC run", flush=True)
+                client.retrieve(time=run, stream="wave", type="fc", step=STEPS, param=PARAMS, target=target)
+                print(f"Downloaded from {source}", flush=True)
+                return target
+            except Exception as e:
+                print(f"  {source} {run:02d} UTC failed: {str(e)[:200]}", flush=True)
+                last = e
+    raise SystemExit(f"Download failed from every source: {last}")
 
 def coastal_cells(ds):
     """For each grid row, keep the first sea cell east of the coast (the wave model has no data on land)."""
