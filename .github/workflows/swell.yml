@@ -1,0 +1,32 @@
+name: Update swell
+
+on:
+  schedule:
+    # ECMWF's 00 and 12 UTC wave runs are published roughly 8 hours later.
+    # 21:30 and 09:30 UTC = about 8:30am and 8:30pm in NSW summer.
+    - cron: "30 9,21 * * *"
+  workflow_dispatch: {}   # adds a "Run workflow" button for testing
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install ecmwf-opendata xarray cfgrib eccodes numpy
+      - name: Download and extract the NSW coast
+        run: python update_swell.py
+      - name: Save swell.json
+        run: |
+          git config user.name "skycheck-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add swell.json
+          git commit -m "Swell update" || echo "No change"
+          git push
