@@ -20,13 +20,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install ecmwf-opendata xarray cfgrib eccodes numpy
+        run: pip install xarray cfgrib eccodes numpy
       - name: Download and extract the NSW coast
         run: python update_swell.py
-      - name: Save swell.json
+      - name: Save swell.json and gusts.json
         run: |
           git config user.name "skycheck-bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add swell.json
-          git commit -m "Swell update" || echo "No change"
+          git add swell.json gusts.json 2>/dev/null || git add swell.json
+          git commit -m "Swell and gust update" || echo "No change"
           git push
