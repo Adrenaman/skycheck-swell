@@ -1,6 +1,7 @@
-"""SkyCheck swell updater.
+"""SkyCheck swell and gust updater.
 Downloads ECMWF's free open-data wave forecast (CC BY 4.0) and saves the forecast for the
 grid cells just off the NSW coast into swell.json, which the SkyCheck page reads.
+Also saves ECMWF's 10 m wind gust forecast for the SkyCheck area into gusts.json.
 Runs on GitHub Actions twice a day (see .github/workflows/swell.yml)."""
 import json, math, sys, datetime as dt
 import numpy as np
@@ -45,33 +46,43 @@ def runs_to_try():
                 out.append((d.strftime("%Y%m%d"), hh))
     return out
 
-def download(target="wave.grib2"):
+def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, optional=False):
+    """Download only the fields we need, one small request at a time.
+    stream: "wave" or "oper" (the atmosphere model). params: GRIB short names; the first one
+    found in the index is used when optional=True (names differ slightly between model versions)."""
     last = None
-    for ymd, hh in runs_to_try():
+    for ymd, hh in ([run] if run else runs_to_try()):
         for base in MIRRORS:
-            root = f"{base}/{ymd}/{hh:02d}z/ifs/0p25/wave/{ymd}{hh:02d}0000"
+            root = f"{base}/{ymd}/{hh:02d}z/ifs/0p25/{stream}/{ymd}{hh:02d}0000"
             try:
-                # make sure the run is complete before downloading it
-                if fetch(f"{root}-{STEPS[-1]}h-wave-fc.index") is None:
-                    print(f"{ymd} {hh:02d}z not complete on {base.split('/')[2]}", flush=True); continue
-                print(f"Downloading {ymd} {hh:02d}z from {base.split('/')[2]}", flush=True)
-                chunks = []
+                if fetch(f"{root}-{STEPS[-1]}h-{stream}-fc.index") is None:
+                    print(f"{stream} {ymd} {hh:02d}z not complete on {base.split('/')[2]}", flush=True); continue
+                print(f"Downloading {stream} {ymd} {hh:02d}z from {base.split('/')[2]}", flush=True)
+                chunks, used = [], None
                 for st in STEPS:
-                    idx = fetch(f"{root}-{st}h-wave-fc.index")
+                    if optional and st == 0: continue          # gusts are a max over the previous hours: none at step 0
+                    idx = fetch(f"{root}-{st}h-{stream}-fc.index")
                     if idx is None: raise RuntimeError(f"missing index for step {st}")
                     entries = [json.loads(l) for l in idx.decode().splitlines() if l.strip()]
-                    for p in PARAMS:
+                    wanted = params if not optional else ([used] if used else params)
+                    for p in wanted:
                         e = next((x for x in entries if x.get("param") == p), None)
-                        if e is None: raise RuntimeError(f"{p} missing at step {st}")
-                        chunks.append(fetch(f"{root}-{st}h-wave-fc.grib2", (int(e["_offset"]), int(e["_length"]))))
+                        if e is None:
+                            if optional: continue
+                            raise RuntimeError(f"{p} missing at step {st}")
+                        chunks.append(fetch(f"{root}-{st}h-{stream}-fc.grib2", (int(e["_offset"]), int(e["_length"]))))
+                        if optional: used = p; break
                     time.sleep(0.05)
+                if optional and not used:
+                    print(f"  none of {params} published in {stream}", flush=True); return None, None
                 with open(target, "wb") as fh:
                     for c in chunks: fh.write(c)
-                print(f"Downloaded {len(chunks)} fields", flush=True)
-                return target
+                print(f"Downloaded {len(chunks)} {stream} fields", flush=True)
+                return target, (ymd, hh, used)
             except Exception as ex:
                 print(f"  failed on {base.split('/')[2]}: {str(ex)[:160]}", flush=True)
                 last = ex
+    if optional: return None, None
     raise SystemExit(f"Download failed: {last}")
 
 def coastal_cells(ds):
@@ -111,6 +122,25 @@ def build(ds):
         "cells": coastal_cells(ds),
     }
 
+GUST_BOX = dict(lat=(-35.0, -31.0), lon=(149.75, 153.0))   # Sydney to the Upper Hunter and Port Stephens
+GUST_PARAMS = ["10fg", "fg310", "i10fg"]                       # 10 m wind gust (name varies by model version)
+
+def gust_grid(ds, run_ms):
+    var = list(ds.data_vars)[0]
+    sub = ds[var].sel(latitude=slice(GUST_BOX["lat"][1], GUST_BOX["lat"][0]), longitude=slice(*GUST_BOX["lon"]))
+    steps_h = (sub["step"].values / np.timedelta64(1, "h")).astype(int)
+    lats, lons = sub["latitude"].values, sub["longitude"].values
+    v = sub.values  # (step, lat, lon) in m/s
+    return {
+        "updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="minutes"),
+        "run": run_ms, "source": "ECMWF open data, 10 m wind gust (CC BY 4.0)",
+        "note": "g[i] is the strongest gust (m/s x 10) in the hours up to times[i]",
+        "times": [int(run_ms + h * 3600_000) for h in steps_h],
+        "lat0": round(float(lats[0]), 2), "lon0": round(float(lons[0]), 2), "dlat": round(float(lats[1] - lats[0]), 2), "dlon": round(float(lons[1] - lons[0]), 2),
+        "nlat": int(len(lats)), "nlon": int(len(lons)),
+        "g": [[[None if np.isnan(x) else int(round(float(x) * 10)) for x in row] for row in v[k]] for k in range(len(steps_h))],
+    }
+
 if __name__ == "__main__":
     import xarray as xr
     f = download()
@@ -122,3 +152,16 @@ if __name__ == "__main__":
     with open("swell.json", "w") as fh:
         json.dump(out, fh, separators=(",", ":"))
     print(f"Saved {len(out['cells'])} coastal cells, {len(out['times'])} times, run {out['run']}")
+
+    # gusts: same model run as the waves, so the two line up
+    run_dt = dt.datetime.fromtimestamp(out["run"] / 1000, dt.timezone.utc)
+    try:
+        gf, info = download("oper", GUST_PARAMS, "gust.grib2", run=(run_dt.strftime("%Y%m%d"), run_dt.hour), optional=True)
+        if gf:
+            gds = xr.open_dataset(gf, engine="cfgrib", backend_kwargs={"filter_by_keys": {"shortName": info[2]}, "indexpath": ""})
+            gout = gust_grid(gds, out["run"])
+            with open("gusts.json", "w") as fh:
+                json.dump(gout, fh, separators=(",", ":"))
+            print(f"Saved gusts ({info[2]}): {gout['nlat']}x{gout['nlon']} grid, {len(gout['times'])} times")
+    except Exception as ex:
+        print(f"Gusts skipped this run: {str(ex)[:200]}")   # swell.json is still saved
