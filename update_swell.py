@@ -19,21 +19,25 @@ MIRRORS = [
     "https://data.ecmwf.int/forecasts",
 ]
 
-def fetch(url, rng=None, tries=4):
-    """One polite request at a time, short back-off, then give up so another copy can be tried."""
+def fetch(url, rng=None, tries=6):
+    """One polite request at a time, with back-off. Byte-range pieces are checked: they must be exactly
+    the expected size and be a GRIB message, otherwise they're fetched again (or another copy is tried)."""
     for k in range(tries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "skycheck-swell (iflyhigh.com.au)"})
             if rng: req.add_header("Range", f"bytes={rng[0]}-{rng[0] + rng[1] - 1}")
             with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
+                data = r.read()
+            if rng and (len(data) != rng[1] or not data.startswith(b"GRIB") or not data.endswith(b"7777")):
+                raise ValueError(f"bad piece ({len(data)} bytes, expected {rng[1]})")
+            return data
         except urllib.error.HTTPError as e:
             if e.code == 404: return None
-            wait = 3 * (k + 1)
-        except Exception:
-            wait = 3 * (k + 1)
-        time.sleep(wait)
-    raise RuntimeError(f"Gave up on {url}")
+            err = e
+        except Exception as e:
+            err = e
+        time.sleep(min(30, 4 * (k + 1)))
+    raise RuntimeError(f"Gave up on {url}: {err}")
 
 def runs_to_try():
     """Newest 00 or 12 UTC runs first (those go out 10 days)."""
@@ -46,7 +50,7 @@ def runs_to_try():
                 out.append((d.strftime("%Y%m%d"), hh))
     return out
 
-def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, optional=False):
+def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, optional=False, check=None):
     """Download only the fields we need, one small request at a time.
     stream: "wave" or "oper" (the atmosphere model). params: GRIB short names; the first one
     found in the index is used when optional=True (names differ slightly between model versions)."""
@@ -78,7 +82,9 @@ def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, option
                 with open(target, "wb") as fh:
                     for c in chunks: fh.write(c)
                 print(f"Downloaded {len(chunks)} {stream} fields", flush=True)
-                return target, (ymd, hh, used)
+                info = (ymd, hh, used)
+                if check: check(target, info)      # raises if the file can't be read; then the next copy is tried
+                return target, info
             except Exception as ex:
                 print(f"  failed on {base.split('/')[2]}: {str(ex)[:160]}", flush=True)
                 last = ex
@@ -141,11 +147,35 @@ def gust_grid(ds, run_ms):
         "g": [[[None if np.isnan(x) else int(round(float(x) * 10)) for x in row] for row in v[k]] for k in range(len(steps_h))],
     }
 
+def open_param(path, short):
+    """Read one parameter. GRIB decoders sometimes name a field slightly differently from the download
+    index (e.g. gusts as 10fg, 10fg3 or 10fg6 depending on the time window), so fall back to matching
+    by prefix and joining the pieces along the forecast steps."""
+    import xarray as xr, cfgrib
+    key = short.lstrip("0123456789i")[:2] if short[0].isdigit() or short.startswith("i") else short
+    parts = []
+    for d in cfgrib.open_datasets(path, backend_kwargs={"indexpath": ""}):
+        for v in d.data_vars:
+            sn = str(d[v].attrs.get("GRIB_shortName", v))
+            if sn == short or sn.startswith(short) or (key and key in sn):
+                da = d[v]
+                if "step" not in da.dims: da = da.expand_dims("step")
+                parts.append(da.rename(short))
+    if not parts: raise ValueError(f"{short} not found in {path}")
+    da = xr.concat(parts, "step").sortby("step") if len(parts) > 1 else parts[0]
+    _, keep = np.unique(da["step"].values, return_index=True)
+    return da.isel(step=np.sort(keep))
+
+def read_wave(path, info=None):
+    import xarray as xr
+    ds = xr.merge([open_param(path, p) for p in PARAMS], compat="override", join="override")
+    if ds["swh"].sizes.get("step", 0) < 20: raise ValueError("too few forecast steps in wave file")
+    return ds
+
 if __name__ == "__main__":
     import xarray as xr
-    f = download()
-    ds = xr.merge([xr.open_dataset(f, engine="cfgrib", backend_kwargs={"filter_by_keys": {"shortName": p}, "indexpath": ""})[[p]]
-                   for p in PARAMS], compat="override")
+    f, _ = download(check=lambda p, i: read_wave(p))
+    ds = read_wave(f)
     out = build(ds)
     if len(out["cells"]) < 10:
         raise SystemExit("Too few coastal cells found, not overwriting swell.json")
@@ -156,9 +186,10 @@ if __name__ == "__main__":
     # gusts: same model run as the waves, so the two line up
     run_dt = dt.datetime.fromtimestamp(out["run"] / 1000, dt.timezone.utc)
     try:
-        gf, info = download("oper", GUST_PARAMS, "gust.grib2", run=(run_dt.strftime("%Y%m%d"), run_dt.hour), optional=True)
+        gf, info = download("oper", GUST_PARAMS, "gust.grib2", run=(run_dt.strftime("%Y%m%d"), run_dt.hour), optional=True,
+                            check=lambda p, i: open_param(p, i[2]))
         if gf:
-            gds = xr.open_dataset(gf, engine="cfgrib", backend_kwargs={"filter_by_keys": {"shortName": info[2]}, "indexpath": ""})
+            gds = open_param(gf, info[2]).to_dataset()
             gout = gust_grid(gds, out["run"])
             with open("gusts.json", "w") as fh:
                 json.dump(gout, fh, separators=(",", ":"))
