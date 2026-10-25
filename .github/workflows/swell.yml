@@ -23,10 +23,10 @@ jobs:
         run: pip install xarray cfgrib eccodes numpy
       - name: Download and extract the NSW coast
         run: python update_swell.py
-      - name: Save swell.json and gusts.json
+      - name: Save swell.json, gusts.json and gfs.json
         run: |
           git config user.name "skycheck-bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add swell.json gusts.json 2>/dev/null || git add swell.json
-          git commit -m "Swell and gust update" || echo "No change"
+          git add swell.json; git add gusts.json || true; git add gfs.json || true
+          git commit -m "Swell, gust and GFS update" || echo "No change"
           git push
