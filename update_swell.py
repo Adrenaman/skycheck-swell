@@ -1,7 +1,8 @@
 """SkyCheck swell and gust updater.
 Downloads ECMWF's free open-data wave forecast (CC BY 4.0) and saves the forecast for the
 grid cells just off the NSW coast into swell.json, which the SkyCheck page reads.
-Also saves ECMWF's 10 m wind gust forecast for the SkyCheck area into gusts.json.
+Also saves ECMWF's 10 m wind gust forecast for the SkyCheck area into gusts.json,
+and the American GFS model's cloud, rain and gusts into gfs.json, so SkyCheck can compare two models.
 Runs on GitHub Actions twice a day (see .github/workflows/swell.yml)."""
 import json, math, sys, datetime as dt
 import numpy as np
@@ -172,6 +173,87 @@ def read_wave(path, info=None):
     if ds["swh"].sizes.get("step", 0) < 20: raise ValueError("too few forecast steps in wave file")
     return ds
 
+# ---------- GFS (US NOAA, public domain): a second, independent model ----------
+GFS_MIRRORS = ["https://noaa-gfs-bdp-pds.s3.amazonaws.com", "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod"]
+GFS_STEPS = list(range(3, 169, 3))            # every 3 h to 7 days
+GFS_FIELDS = [("LCDC", "low cloud layer", "lcc"), ("MCDC", "middle cloud layer", "mcc"), ("HCDC", "high cloud layer", "hcc"),
+              ("PRATE", "surface", "prate")]
+
+def gfs_runs():
+    now = dt.datetime.now(dt.timezone.utc); out = []
+    for back in range(0, 30, 6):
+        t = now - dt.timedelta(hours=back + 4)        # runs are complete about 4-5 h after their start time
+        hh = (t.hour // 6) * 6
+        out.append((t.strftime("%Y%m%d"), hh))
+    return list(dict.fromkeys(out))
+
+def parse_idx(text):
+    """GFS .idx lines look like '12:345678:d=2026102500:TCDC:entire atmosphere:3 hour fcst:' -> (offset, length, var, level)."""
+    rows = [l.split(":") for l in text.splitlines() if l.strip()]
+    out = []
+    for i, r in enumerate(rows):
+        off = int(r[1]); nxt = int(rows[i + 1][1]) if i + 1 < len(rows) else None
+        out.append((off, (nxt - off) if nxt else None, r[3], r[4], ":".join(r[5:])))
+    return out
+
+def download_gfs(target="gfs.grib2", check=None):
+    last = None
+    for ymd, hh in gfs_runs():
+        for base in GFS_MIRRORS:
+            root = f"{base}/gfs.{ymd}/{hh:02d}/atmos/gfs.t{hh:02d}z.pgrb2.0p25"
+            try:
+                if fetch(f"{root}.f{GFS_STEPS[-1]:03d}.idx") is None:
+                    print(f"GFS {ymd} {hh:02d}z not complete on {base.split('/')[2]}", flush=True); continue
+                print(f"Downloading GFS {ymd} {hh:02d}z from {base.split('/')[2]}", flush=True)
+                chunks = []
+                for st in GFS_STEPS:
+                    idx = fetch(f"{root}.f{st:03d}.idx")
+                    if idx is None: raise RuntimeError(f"missing GFS index f{st:03d}")
+                    entries = parse_idx(idx.decode())
+                    for var, level, _ in GFS_FIELDS:
+                        e = next((x for x in entries if x[2] == var and x[3] == level and x[1]), None)
+                        if e is None:
+                            if var == "GUST": continue            # optional
+                            raise RuntimeError(f"{var} {level} missing at f{st:03d}")
+                        chunks.append(fetch(f"{root}.f{st:03d}", (e[0], e[1])))
+                    time.sleep(0.05)
+                with open(target, "wb") as fh:
+                    for c in chunks: fh.write(c)
+                print(f"Downloaded {len(chunks)} GFS fields", flush=True)
+                info = (ymd, hh)
+                if check: check(target, info)
+                return target, info
+            except Exception as ex:
+                print(f"  GFS failed on {base.split('/')[2]}: {str(ex)[:160]}", flush=True); last = ex
+    return None, None
+
+def gfs_grid(path, info):
+    run = dt.datetime.strptime(info[0], "%Y%m%d").replace(hour=info[1], tzinfo=dt.timezone.utc)
+    run_ms = int(run.timestamp() * 1000)
+    out = {"updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="minutes"), "run": run_ms,
+           "source": "NOAA GFS 0.25 degree (public domain)",
+           "note": "lo/mi/hi: cloud % ; pr: rain mm/h x10 ; each value covers the hours up to times[i]"}
+    keys = {"lcc": "lo", "mcc": "mi", "hcc": "hi", "tcc": "tc", "prate": "pr", "gust": "g"}
+    first = True
+    for _, _, short in GFS_FIELDS:
+        try: da = open_param(path, short)
+        except Exception:
+            if short == "gust": continue
+            raise
+        sub = da.sel(latitude=slice(GUST_BOX["lat"][1], GUST_BOX["lat"][0]), longitude=slice(*GUST_BOX["lon"]))
+        if first:
+            steps_h = (sub["step"].values / np.timedelta64(1, "h")).astype(int)
+            lats, lons = sub["latitude"].values, sub["longitude"].values
+            out.update({"times": [int(run_ms + h * 3600_000) for h in steps_h],
+                        "lat0": round(float(lats[0]), 2), "lon0": round(float(lons[0]), 2),
+                        "dlat": round(float(lats[1] - lats[0]), 2), "dlon": round(float(lons[1] - lons[0]), 2),
+                        "nlat": int(len(lats)), "nlon": int(len(lons))})
+            first = False
+        scale = 3600 * 10 if short == "prate" else (10 if short == "gust" else 1)   # kg/m2/s -> mm/h x10
+        v = sub.values
+        out[keys[short]] = [[[None if np.isnan(x) else int(round(float(x) * scale)) for x in row] for row in v[k]] for k in range(v.shape[0])]
+    return out
+
 if __name__ == "__main__":
     import xarray as xr
     f, _ = download(check=lambda p, i: read_wave(p))
@@ -196,3 +278,16 @@ if __name__ == "__main__":
             print(f"Saved gusts ({info[2]}): {gout['nlat']}x{gout['nlon']} grid, {len(gout['times'])} times")
     except Exception as ex:
         print(f"Gusts skipped this run: {str(ex)[:200]}")   # swell.json is still saved
+
+    # GFS: second model for cloud, rain and gusts
+    try:
+        gf2, ginfo = download_gfs(check=lambda p, i: open_param(p, "lcc"))
+        if gf2:
+            g2 = gfs_grid(gf2, ginfo)
+            with open("gfs.json", "w") as fh:
+                json.dump(g2, fh, separators=(",", ":"))
+            print(f"Saved GFS {ginfo[0]} {ginfo[1]:02d}z: {g2['nlat']}x{g2['nlon']} grid, {len(g2['times'])} times")
+        else:
+            print("GFS skipped this run")
+    except Exception as ex:
+        print(f"GFS skipped this run: {str(ex)[:200]}")
