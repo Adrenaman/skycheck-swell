@@ -129,7 +129,39 @@ def build(ds):
         "cells": coastal_cells(ds),
     }
 
-GUST_BOX = dict(lat=(-35.0, -31.0), lon=(149.75, 153.0))   # Sydney to the Upper Hunter and Port Stephens
+GUST_BOX = dict(lat=(-35.0, -31.0), lon=(149.75, 153.0))   # Sydney to the Upper Hunter (kept for older copies of SkyCheck)
+
+# All of NSW, saved as small 2 x 2 degree tiles so each phone only downloads its own area.
+# Tile ty,tx covers latitude -28-2*ty down to -30-2*ty and longitude 140+2*tx to 142+2*tx (edges included in both neighbours).
+TILE_ROWS, TILE_COLS = 5, 7          # -28..-38 S, 140..154 E
+
+def write_tiles(fields, run_ms, folder):
+    """fields: {key: (DataArray with step/latitude/longitude, scale)} -> folder/t{ty}_{tx}.json"""
+    import os
+    os.makedirs(folder, exist_ok=True)
+    n = 0
+    for ty in range(TILE_ROWS):
+        for tx in range(TILE_COLS):
+            top, bot, l, r = -28 - 2 * ty, -30 - 2 * ty, 140 + 2 * tx, 142 + 2 * tx
+            out = {"updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="minutes"), "run": run_ms}
+            empty = True
+            for key, (da, scale) in fields.items():
+                sub = da.sel(latitude=slice(top + 0.001, bot - 0.001), longitude=slice(l - 0.001, r + 0.001))
+                if "times" not in out:
+                    steps_h = (sub["step"].values / np.timedelta64(1, "h")).astype(int)
+                    lats, lons = sub["latitude"].values, sub["longitude"].values
+                    out.update({"times": [int(run_ms + h * 3600_000) for h in steps_h],
+                                "lat0": round(float(lats[0]), 2), "lon0": round(float(lons[0]), 2),
+                                "dlat": round(float(lats[1] - lats[0]), 2), "dlon": round(float(lons[1] - lons[0]), 2),
+                                "nlat": int(len(lats)), "nlon": int(len(lons))})
+                v = sub.values
+                if not np.all(np.isnan(v)): empty = False
+                out[key] = [[[None if np.isnan(x) else int(round(float(x) * scale)) for x in row] for row in v[k]] for k in range(v.shape[0])]
+            if empty: continue
+            with open(f"{folder}/t{ty}_{tx}.json", "w") as fh:
+                json.dump(out, fh, separators=(",", ":"))
+            n += 1
+    return n
 GUST_PARAMS = ["10fg", "fg310", "i10fg"]                       # 10 m wind gust (name varies by model version)
 
 def gust_grid(ds, run_ms):
@@ -275,6 +307,8 @@ if __name__ == "__main__":
             gout = gust_grid(gds, out["run"])
             with open("gusts.json", "w") as fh:
                 json.dump(gout, fh, separators=(",", ":"))
+            gvar = gds[list(gds.data_vars)[0]]
+            print(f"Saved {write_tiles({'g': (gvar, 10)}, out['run'], 'gusts')} NSW gust tiles")
             print(f"Saved gusts ({info[2]}): {gout['nlat']}x{gout['nlon']} grid, {len(gout['times'])} times")
     except Exception as ex:
         print(f"Gusts skipped this run: {str(ex)[:200]}")   # swell.json is still saved
@@ -286,6 +320,8 @@ if __name__ == "__main__":
             g2 = gfs_grid(gf2, ginfo)
             with open("gfs.json", "w") as fh:
                 json.dump(g2, fh, separators=(",", ":"))
+            fl = {k: (open_param(gf2, sn), sc) for k, sn, sc in (("lo", "lcc", 1), ("mi", "mcc", 1), ("hi", "hcc", 1), ("pr", "prate", 3600 * 10))}
+            print(f"Saved {write_tiles(fl, g2['run'], 'gfs')} NSW GFS tiles")
             print(f"Saved GFS {ginfo[0]} {ginfo[1]:02d}z: {g2['nlat']}x{g2['nlon']} grid, {len(g2['times'])} times")
         else:
             print("GFS skipped this run")
