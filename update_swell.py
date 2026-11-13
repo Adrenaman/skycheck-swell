@@ -51,20 +51,22 @@ def runs_to_try():
                 out.append((d.strftime("%Y%m%d"), hh))
     return out
 
-def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, optional=False, check=None):
+def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, optional=False, check=None,
+             model="ifs", res="0p25", steps=None, each=False):
     """Download only the fields we need, one small request at a time.
     stream: "wave" or "oper" (the atmosphere model). params: GRIB short names; the first one
     found in the index is used when optional=True (names differ slightly between model versions)."""
     last = None
     for ymd, hh in ([run] if run else runs_to_try()):
         for base in MIRRORS:
-            root = f"{base}/{ymd}/{hh:02d}z/ifs/0p25/{stream}/{ymd}{hh:02d}0000"
+            root = f"{base}/{ymd}/{hh:02d}z/{model}/{res}/{stream}/{ymd}{hh:02d}0000"
+            st_list = steps or STEPS
             try:
-                if fetch(f"{root}-{STEPS[-1]}h-{stream}-fc.index") is None:
+                if fetch(f"{root}-{st_list[-1]}h-{stream}-fc.index") is None:
                     print(f"{stream} {ymd} {hh:02d}z not complete on {base.split('/')[2]}", flush=True); continue
-                print(f"Downloading {stream} {ymd} {hh:02d}z from {base.split('/')[2]}", flush=True)
-                chunks, used = [], None
-                for st in STEPS:
+                print(f"Downloading {model} {res} {stream} {ymd} {hh:02d}z from {base.split('/')[2]}", flush=True)
+                chunks, used, found = [], None, set()
+                for st in st_list:
                     if optional and st == 0: continue          # gusts are a max over the previous hours: none at step 0
                     idx = fetch(f"{root}-{st}h-{stream}-fc.index")
                     if idx is None: raise RuntimeError(f"missing index for step {st}")
@@ -73,13 +75,18 @@ def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, option
                     for p in wanted:
                         e = next((x for x in entries if x.get("param") == p), None)
                         if e is None:
-                            if optional: continue
+                            if optional or each: continue
                             raise RuntimeError(f"{p} missing at step {st}")
+                        if each:
+                            found.add(p); chunks.append(fetch(f"{root}-{st}h-{stream}-fc.grib2", (int(e["_offset"]), int(e["_length"])))); continue
                         chunks.append(fetch(f"{root}-{st}h-{stream}-fc.grib2", (int(e["_offset"]), int(e["_length"]))))
                         if optional: used = p; break
                     time.sleep(0.05)
                 if optional and not used:
                     print(f"  none of {params} published in {stream}", flush=True); return None, None
+                if each and not found:
+                    print(f"  none of {params} published in {model} {stream}", flush=True); return None, None
+                if each: used = sorted(found)
                 with open(target, "wb") as fh:
                     for c in chunks: fh.write(c)
                 print(f"Downloaded {len(chunks)} {stream} fields", flush=True)
@@ -209,7 +216,7 @@ def read_wave(path, info=None):
 GFS_MIRRORS = ["https://noaa-gfs-bdp-pds.s3.amazonaws.com", "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod"]
 GFS_STEPS = list(range(3, 169, 3))            # every 3 h to 7 days
 GFS_FIELDS = [("LCDC", "low cloud layer", "lcc"), ("MCDC", "middle cloud layer", "mcc"), ("HCDC", "high cloud layer", "hcc"),
-              ("PRATE", "surface", "prate")]
+              ("PRATE", "surface", "prate"), ("CAPE", "surface", "cape")]
 
 def gfs_runs():
     now = dt.datetime.now(dt.timezone.utc); out = []
@@ -245,7 +252,7 @@ def download_gfs(target="gfs.grib2", check=None):
                     for var, level, _ in GFS_FIELDS:
                         e = next((x for x in entries if x[2] == var and x[3] == level and x[1]), None)
                         if e is None:
-                            if var == "GUST": continue            # optional
+                            if var in ("GUST", "CAPE"): continue   # optional
                             raise RuntimeError(f"{var} {level} missing at f{st:03d}")
                         chunks.append(fetch(f"{root}.f{st:03d}", (e[0], e[1])))
                     time.sleep(0.05)
@@ -265,12 +272,12 @@ def gfs_grid(path, info):
     out = {"updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="minutes"), "run": run_ms,
            "source": "NOAA GFS 0.25 degree (public domain)",
            "note": "lo/mi/hi: cloud % ; pr: rain mm/h x10 ; each value covers the hours up to times[i]"}
-    keys = {"lcc": "lo", "mcc": "mi", "hcc": "hi", "tcc": "tc", "prate": "pr", "gust": "g"}
+    keys = {"lcc": "lo", "mcc": "mi", "hcc": "hi", "tcc": "tc", "prate": "pr", "gust": "g", "cape": "cp"}
     first = True
     for _, _, short in GFS_FIELDS:
         try: da = open_param(path, short)
         except Exception:
-            if short == "gust": continue
+            if short in ("gust", "cape"): continue
             raise
         sub = da.sel(latitude=slice(GUST_BOX["lat"][1], GUST_BOX["lat"][0]), longitude=slice(*GUST_BOX["lon"]))
         if first:
@@ -281,7 +288,7 @@ def gfs_grid(path, info):
                         "dlat": round(float(lats[1] - lats[0]), 2), "dlon": round(float(lons[1] - lons[0]), 2),
                         "nlat": int(len(lats)), "nlon": int(len(lons))})
             first = False
-        scale = 3600 * 10 if short == "prate" else (10 if short == "gust" else 1)   # kg/m2/s -> mm/h x10
+        scale = 3600 * 10 if short == "prate" else (10 if short == "gust" else (0.1 if short == "cape" else 1))   # rain mm/h x10, CAPE J/kg / 10
         v = sub.values
         out[keys[short]] = [[[None if np.isnan(x) else int(round(float(x) * scale)) for x in row] for row in v[k]] for k in range(v.shape[0])]
     return out
@@ -300,18 +307,61 @@ if __name__ == "__main__":
     # gusts: same model run as the waves, so the two line up
     run_dt = dt.datetime.fromtimestamp(out["run"] / 1000, dt.timezone.utc)
     try:
-        gf, info = download("oper", GUST_PARAMS, "gust.grib2", run=(run_dt.strftime("%Y%m%d"), run_dt.hour), optional=True,
+        RUN = (run_dt.strftime("%Y%m%d"), run_dt.hour)
+        gres = "0p1"
+        gf, info = download("oper", GUST_PARAMS, "gust.grib2", run=RUN, optional=True, res="0p1",
                             check=lambda p, i: open_param(p, i[2]))
+        if not gf:
+            gres = "0p25"
+            gf, info = download("oper", GUST_PARAMS, "gust.grib2", run=RUN, optional=True,
+                                check=lambda p, i: open_param(p, i[2]))
         if gf:
             gds = open_param(gf, info[2]).to_dataset()
             gout = gust_grid(gds, out["run"])
             with open("gusts.json", "w") as fh:
                 json.dump(gout, fh, separators=(",", ":"))
             gvar = gds[list(gds.data_vars)[0]]
-            print(f"Saved {write_tiles({'g': (gvar, 10)}, out['run'], 'gusts')} NSW gust tiles")
+            tf = {'g': (gvar, 10)}
+            try:   # ECMWF storm fuel for the lightning risk, same resolution as the gusts
+                cf, cinfo = download("oper", ["mucape"], "cape.grib2", run=RUN, optional=True, res=gres,
+                                     check=lambda p, i: open_param(p, "mucape"))
+                if cf: tf['cp'] = (open_param(cf, "mucape"), 0.1)
+            except Exception as ex: print(f"  ECMWF CAPE skipped: {str(ex)[:120]}")
+            print(f"Saved {write_tiles(tf, out['run'], 'gusts')} NSW gust tiles ({gres}{', with CAPE' if 'cp' in tf else ''})")
             print(f"Saved gusts ({info[2]}): {gout['nlat']}x{gout['nlon']} grid, {len(gout['times'])} times")
     except Exception as ex:
         print(f"Gusts skipped this run: {str(ex)[:200]}")   # swell.json is still saved
+
+    # AIFS: ECMWF's AI model, a third opinion on cloud, rain and storm fuel (open data, CC BY 4.0)
+    try:
+        AIFS_STEPS = list(range(0, 169, 6))
+        af, ainfo = download("oper", ["lcc", "mcc", "hcc", "tcc", "tp", "mucape"], "aifs.grib2", run=RUN, model="aifs-single",
+                             steps=AIFS_STEPS, each=True, check=lambda p, i: open_param(p, i[2][0]))
+        if af:
+            have = ainfo[2]; fl = {}
+            def cloud(sn):
+                da = open_param(af, sn); return (da, 100 if float(da.max()) <= 1.5 else 1)   # fraction or percent
+            for k, sn in (("lo", "lcc"), ("mi", "mcc"), ("hi", "hcc")):
+                if sn in have: fl[k] = cloud(sn)
+            if "tp" in have:
+                tp = open_param(af, "tp")   # metres, accumulated from the start of the run
+                d = tp.diff("step").clip(min=0)
+                hrs = (d["step"].values / np.timedelta64(1, "h"))
+                prev = np.concatenate([[0], hrs[:-1]]); span = (hrs - prev).reshape(-1, 1, 1)
+                fl["pr"] = ((d / span) * 1000, 10)   # mm per hour x10 over each 6 h step
+            if "mucape" in have: fl["cp"] = (open_param(af, "mucape"), 0.1)
+            if len([k for k in fl if k in ("lo", "mi", "hi")]) == 3:
+                # tiles need the same steps for every field: drop the step-0 analysis from fields that have it
+                for k in list(fl):
+                    da, sc = fl[k]; fl[k] = (da.sel(step=da["step"] > np.timedelta64(0, "h")), sc)
+                run_ms = int(dt.datetime.strptime(ainfo[0], "%Y%m%d").replace(hour=ainfo[1], tzinfo=dt.timezone.utc).timestamp() * 1000)
+                print(f"Saved {write_tiles(fl, run_ms, 'aifs')} NSW AIFS tiles ({', '.join(sorted(fl))})")
+            else:
+                print(f"AIFS cloud layers not published ({have}), skipped")
+        else:
+            print("AIFS skipped this run")
+    except Exception as ex:
+        print(f"AIFS skipped this run: {str(ex)[:200]}")
 
     # GFS: second model for cloud, rain and gusts
     try:
@@ -321,6 +371,8 @@ if __name__ == "__main__":
             with open("gfs.json", "w") as fh:
                 json.dump(g2, fh, separators=(",", ":"))
             fl = {k: (open_param(gf2, sn), sc) for k, sn, sc in (("lo", "lcc", 1), ("mi", "mcc", 1), ("hi", "hcc", 1), ("pr", "prate", 3600 * 10))}
+            try: fl["cp"] = (open_param(gf2, "cape"), 0.1)
+            except Exception as ex: print(f"  GFS CAPE not available: {str(ex)[:80]}")
             print(f"Saved {write_tiles(fl, g2['run'], 'gfs')} NSW GFS tiles")
             print(f"Saved GFS {ginfo[0]} {ginfo[1]:02d}z: {g2['nlat']}x{g2['nlon']} grid, {len(g2['times'])} times")
         else:
