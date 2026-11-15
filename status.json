@@ -1,5 +1,5 @@
 {
- "started": "2026-11-15T01:10+00:00",
+ "started": "2026-11-15T03:21+00:00",
  "parts": {
   "swell": {
    "ok": true,
@@ -9,7 +9,7 @@
   "gusts": {
    "ok": true,
    "tiles": 35,
-   "resolution": "0p25",
+   "resolution": "0p1",
    "cape": true,
    "run": [
     "20261114",
@@ -41,5 +41,5 @@
    ]
   }
  },
- "finished": "2026-11-15T01:14+00:00"
+ "finished": "2026-11-15T03:37+00:00"
 }
