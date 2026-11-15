@@ -1,7 +1,8 @@
 """SkyCheck swell and gust updater.
 Downloads ECMWF's free open-data wave forecast (CC BY 4.0) and saves the forecast for the
 grid cells just off the NSW coast into swell.json, which the SkyCheck page reads.
-Also saves ECMWF's 10 m wind gust forecast for the SkyCheck area into gusts.json,
+Also saves ECMWF's 10 m wind gust and storm-fuel (CAPE) forecast for NSW into gusts.json and gusts/
+(9 km open data when it's out, otherwise the 25 km copy),
 and the American GFS model's cloud, rain and gusts into gfs.json, so SkyCheck can compare two models.
 Runs on GitHub Actions twice a day (see .github/workflows/swell.yml)."""
 import json, math, sys, datetime as dt
@@ -60,15 +61,18 @@ def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, option
     for ymd, hh in ([run] if run else runs_to_try()):
         for base in MIRRORS:
             root = f"{base}/{ymd}/{hh:02d}z/{model}/{res}/{stream}/{ymd}{hh:02d}0000"
+            # At 0.1 deg (9 km) ECMWF splits each step into a surface file ("-fc-sfc") and a pressure-level
+            # file ("-fc-pl"). Everything we use is a surface field. 0.25 deg files have no suffix.
+            fc = "fc-sfc" if res == "0p1" and stream == "oper" else "fc"
             st_list = steps or STEPS
             try:
-                if fetch(f"{root}-{st_list[-1]}h-{stream}-fc.index") is None:
+                if fetch(f"{root}-{st_list[-1]}h-{stream}-{fc}.index") is None:
                     print(f"{stream} {ymd} {hh:02d}z not complete on {base.split('/')[2]}", flush=True); continue
                 print(f"Downloading {model} {res} {stream} {ymd} {hh:02d}z from {base.split('/')[2]}", flush=True)
                 chunks, used, found = [], None, set()
                 for st in st_list:
                     if optional and st == 0: continue          # gusts are a max over the previous hours: none at step 0
-                    idx = fetch(f"{root}-{st}h-{stream}-fc.index")
+                    idx = fetch(f"{root}-{st}h-{stream}-{fc}.index")
                     if idx is None: raise RuntimeError(f"missing index for step {st}")
                     entries = [json.loads(l) for l in idx.decode().splitlines() if l.strip()]
                     wanted = params if not optional else ([used] if used else params)
@@ -78,8 +82,8 @@ def download(stream="wave", params=PARAMS, target="wave.grib2", run=None, option
                             if optional or each: continue
                             raise RuntimeError(f"{p} missing at step {st}")
                         if each:
-                            found.add(p); chunks.append(fetch(f"{root}-{st}h-{stream}-fc.grib2", (int(e["_offset"]), int(e["_length"])))); continue
-                        chunks.append(fetch(f"{root}-{st}h-{stream}-fc.grib2", (int(e["_offset"]), int(e["_length"]))))
+                            found.add(p); chunks.append(fetch(f"{root}-{st}h-{stream}-{fc}.grib2", (int(e["_offset"]), int(e["_length"])))); continue
+                        chunks.append(fetch(f"{root}-{st}h-{stream}-{fc}.grib2", (int(e["_offset"]), int(e["_length"]))))
                         if optional: used = p; break
                     time.sleep(0.05)
                 if optional and not used:
@@ -187,6 +191,8 @@ def gust_grid(ds, run_ms):
         "g": [[[None if np.isnan(x) else int(round(float(x) * 10)) for x in row] for row in v[k]] for k in range(len(steps_h))],
     }
 
+NSW_CROP = dict(lat=(-27.8, -38.2), lon=(139.8, 154.4))   # north to south, west to east
+
 def open_param(path, short):
     """Read one parameter. GRIB decoders sometimes name a field slightly differently from the download
     index (e.g. gusts as 10fg, 10fg3 or 10fg6 depending on the time window), so fall back to matching
@@ -199,6 +205,11 @@ def open_param(path, short):
             sn = str(d[v].attrs.get("GRIB_shortName", v))
             if sn == short or sn.startswith(short) or (key and key in sn):
                 da = d[v]
+                lat = da["latitude"].values if "latitude" in da.coords else None
+                if lat is not None and lat.size > 1 and lat[0] > lat[-1]:
+                    # keep only NSW and its offshore waters (covers BOX, GUST_BOX and every tile) so a
+                    # 9 km global field doesn't have to be held in memory whole
+                    da = da.sel(latitude=slice(*NSW_CROP["lat"]), longitude=slice(*NSW_CROP["lon"]))
                 if "step" not in da.dims: da = da.expand_dims("step")
                 parts.append(da.rename(short))
     if not parts: raise ValueError(f"{short} not found in {path}")

@@ -2,13 +2,17 @@ name: Update swell
 
 on:
   schedule:
-    # ECMWF's 00 and 12 UTC wave runs are published roughly 8 hours later.
-    # 21:30 and 09:30 UTC = about 8:30am and 8:30pm in NSW summer.
-    - cron: "30 9,21 * * *"
+    # ECMWF's 00 and 12 UTC runs: 25 km files out about 7.5 h later, the 9 km gusts about 2 h after that.
+    # 22:15 and 10:15 UTC = about 9:15am and 9:15pm in NSW summer. Off the half hour, when GitHub is less busy.
+    - cron: "15 10,22 * * *"
   workflow_dispatch: {}   # adds a "Run workflow" button for testing
 
 permissions:
   contents: write
+
+concurrency:            # never two runs at once (a late scheduled run + a manual one would clash on push)
+  group: swell
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -29,4 +33,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add swell.json; git add gusts.json || true; git add gfs.json || true; git add gusts || true; git add gfs || true; git add aifs || true; git add status.json || true
           git commit -m "Swell, gust and GFS update" || echo "No change"
+          git pull --rebase -X theirs || true   # pick up any code pushed while this run was working
           git push
