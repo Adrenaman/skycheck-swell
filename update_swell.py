@@ -358,6 +358,46 @@ if __name__ == "__main__":
         print(f"Gusts skipped this run: {str(ex)[:200]}")   # swell.json is still saved
         note("gusts", ok=False, reason=str(ex)[:300])
 
+    # Rain map: ECMWF rain for all of NSW, every 3 h for 3 days, for SkyCheck's animated rain and cloud map.
+    # Saved as one small file: each frame is the grid packed as bytes (mm/h x10), base64 text.
+    try:
+        import base64
+        RAIN_STEPS = list(range(3, 73, 3))
+        rres = "0p1"
+        rf, rinfo = download("oper", ["tp"], "rain.grib2", run=RUN, optional=True, res="0p1", steps=RAIN_STEPS,
+                             check=lambda p, i: open_param(p, "tp"))
+        if not rf:
+            rres = "0p25"
+            rf, rinfo = download("oper", ["tp"], "rain.grib2", run=RUN, optional=True, steps=RAIN_STEPS,
+                                 check=lambda p, i: open_param(p, "tp"))
+        if rf:
+            tp = open_param(rf, "tp")                      # metres of rain since the run started, NSW only
+            steps_h = (tp["step"].values / np.timedelta64(1, "h")).astype(int)
+            acc = np.nan_to_num(tp.values * 1000.0)        # mm
+            prev = np.concatenate([np.zeros_like(acc[:1]), acc[:-1]])
+            span = np.diff(np.concatenate([[0], steps_h])).reshape(-1, 1, 1)
+            rate = np.clip((acc - prev) / span, 0, None)   # average mm/h over each 3 h
+            q = np.clip(np.round(rate * 10), 0, 255).astype(np.uint8)
+            lats, lons = tp["latitude"].values, tp["longitude"].values
+            rmap = {"updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="minutes"), "run": out["run"],
+                    "source": f"ECMWF open data {'9 km' if rres == '0p1' else '25 km'} rain (CC BY 4.0)",
+                    "note": "f[i]: base64 bytes, rows from lat0 going south, columns from lon0 going east; "
+                            "value = average rain in mm/h x10 over the 3 hours ending at times[i]",
+                    "lat0": round(float(lats[0]), 3), "lon0": round(float(lons[0]), 3),
+                    "dlat": round(float(lats[1] - lats[0]), 3), "dlon": round(float(lons[1] - lons[0]), 3),
+                    "nlat": int(len(lats)), "nlon": int(len(lons)),
+                    "times": [int(out["run"] + h * 3600_000) for h in steps_h],
+                    "f": [base64.b64encode(q[k].tobytes()).decode() for k in range(q.shape[0])]}
+            with open("rainmap.json", "w") as fh:
+                json.dump(rmap, fh, separators=(",", ":"))
+            print(f"Saved rain map ({rres}): {rmap['nlat']}x{rmap['nlon']} grid, {len(rmap['f'])} frames")
+            note("rainmap", ok=True, resolution=rres, frames=len(rmap["f"]), grid=[rmap["nlat"], rmap["nlon"]])
+        else:
+            note("rainmap", ok=False, reason="no rain files found on any copy")
+    except Exception as ex:
+        print(f"Rain map skipped this run: {str(ex)[:200]}")
+        note("rainmap", ok=False, reason=str(ex)[:300])
+
     # AIFS: ECMWF's AI model, a third opinion on cloud, rain and storm fuel (open data, CC BY 4.0)
     try:
         AIFS_STEPS = list(range(0, 169, 6))

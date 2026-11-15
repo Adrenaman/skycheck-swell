@@ -31,7 +31,7 @@ jobs:
         run: |
           git config user.name "skycheck-bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add swell.json; git add gusts.json || true; git add gfs.json || true; git add gusts || true; git add gfs || true; git add aifs || true; git add status.json || true
+          git add swell.json; git add gusts.json || true; git add gfs.json || true; git add gusts || true; git add gfs || true; git add aifs || true; git add rainmap.json || true; git add status.json || true
           git commit -m "Swell, gust and GFS update" || echo "No change"
           git pull --rebase -X theirs || true   # pick up any code pushed while this run was working
           git push
