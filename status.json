@@ -1,5 +1,5 @@
 {
- "started": "2026-11-25T19:54+00:00",
+ "started": "2026-11-26T04:07+00:00",
  "parts": {
   "swell": {
    "ok": true,
@@ -9,7 +9,7 @@
   "gusts": {
    "ok": true,
    "tiles": 35,
-   "resolution": "0p25",
+   "resolution": "0p1",
    "cape": true,
    "run": [
     "20261125",
@@ -18,11 +18,11 @@
   },
   "rainmap": {
    "ok": true,
-   "resolution": "0p25",
+   "resolution": "0p1",
    "frames": 24,
    "grid": [
-    41,
-    58
+    104,
+    146
    ]
   },
   "aifs": {
@@ -46,9 +46,9 @@
    "cape": true,
    "run": [
     "20261125",
-    12
+    18
    ]
   }
  },
- "finished": "2026-11-25T20:04+00:00"
+ "finished": "2026-11-26T04:16+00:00"
 }
